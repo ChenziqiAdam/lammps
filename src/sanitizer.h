@@ -49,7 +49,13 @@ namespace Sanitizer {
   };
 
   // VEL-001 / VEL-002 after `velocity create` / `velocity zero`.
-  void check_velocity(LAMMPS *lmp, int groupbit, bool linear, bool rotation);
+  // Magnitude scales (sum m|v|, sum m|r||v|) of the velocities before an operation that
+  // cancels momentum: rounding of the cancellation scales with the cancelled terms.
+  struct VelocityScale {
+    double linear, rotation;
+  };
+  VelocityScale velocity_scale(LAMMPS *lmp, int groupbit);
+  void check_velocity(LAMMPS *lmp, int groupbit, bool linear, bool rotation, const VelocityScale &pre = {0.0, 0.0});
 
   // PBC-001 (all owned atoms, Domain::pbc) and PBC-002 (one atom, Domain::remap):
   // the unwrapped coordinate x + image*box must not change. `lamda` selects
@@ -115,7 +121,7 @@ namespace Sanitizer {
   };
 
   // VIR-002 at the end of ComputePEAtom::compute_peratom
-  void check_peratom_energy(LAMMPS *lmp, const double *energy, bool pairflag, bool bondflag, bool angleflag,
+  void check_peratom_energy(LAMMPS *lmp, const double *energy, int groupbit, bool pairflag, bool bondflag, bool angleflag,
                             bool dihedralflag, bool improperflag, bool kspaceflag, bool fixflag);
 
   // MIN-001: a successful line-search step must not raise the energy.
@@ -134,6 +140,7 @@ namespace Sanitizer {
    private:
     struct Sums {
       double p[3], f[3], pabs, fabs_;
+      int nlocal;
     };
     Sums take() const;
     bool applicable() const;

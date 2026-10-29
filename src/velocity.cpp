@@ -694,8 +694,9 @@ void Velocity::zero(int /*narg*/, char **arg)
 {
   if (strcmp(arg[0],"linear") == 0) {
     if (!rigid_fix) {
+      Sanitizer::VelocityScale sanitize_pre = Sanitizer::velocity_scale(lmp, groupbit);
       zero_momentum();
-      Sanitizer::check_velocity(lmp, groupbit, true, false);
+      Sanitizer::check_velocity(lmp, groupbit, true, false, sanitize_pre);
     } else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
       rigid_fix->setup_pre_neighbor();
       rigid_fix->zero_momentum();
@@ -705,8 +706,9 @@ void Velocity::zero(int /*narg*/, char **arg)
 
   } else if (strcmp(arg[0],"angular") == 0) {
     if (!rigid_fix) {
+      Sanitizer::VelocityScale sanitize_pre = Sanitizer::velocity_scale(lmp, groupbit);
       zero_rotation();
-      Sanitizer::check_velocity(lmp, groupbit, false, true);
+      Sanitizer::check_velocity(lmp, groupbit, false, true, sanitize_pre);
     } else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
       rigid_fix->setup_pre_neighbor();
       rigid_fix->zero_rotation();

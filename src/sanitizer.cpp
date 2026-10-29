@@ -189,6 +189,11 @@ namespace Sanitizer {
     long long step = lmp->update->ntimestep;
     if (stage == PAIR) check_pair_virial(n);
 
+    // With newton off every interaction is evaluated once per owner, in its own image frame:
+    // the rounding then scales with the individual terms, which the net per-atom forces hide
+    // (a perfect crystal has f_i = 0 but pair terms of order one). No verdict without that scale.
+    if (!((stage == PAIR) ? lmp->force->newton_pair : lmp->force->newton_bond)) return;
+
     if (vector_not_zero(df, fscale, n)) report(ids[stage], vec_detail(names[stage], "net force", df, fscale), step);
 
     // torque law: rotation invariance needs a non-periodic box and point particles
@@ -202,7 +207,41 @@ namespace Sanitizer {
   // VEL-001, VEL-002
   // ------------------------------------------------------------------
 
-  void check_velocity(LAMMPS *lmp, int groupbit, bool linear, bool rotation)
+  VelocityScale velocity_scale(LAMMPS *lmp, int groupbit)
+  {
+    VelocityScale out = {0.0, 0.0};
+    if (!enabled()) return out;
+    Atom *atom = lmp->atom;
+    int nlocal = atom->nlocal;
+    double a[5] = {0, 0, 0, 0, 0}, A[5], unwrap[3];
+    for (int i = 0; i < nlocal; i++) {
+      if (!(atom->mask[i] & groupbit)) continue;
+      double m = atom->rmass ? atom->rmass[i] : atom->mass[atom->type[i]];
+      lmp->domain->unmap(atom->x[i], atom->image[i], unwrap);
+      a[0] += m;
+      for (int k = 0; k < 3; k++) a[1 + k] += m * unwrap[k];
+    }
+    MPI_Allreduce(a, A, 4, MPI_DOUBLE, MPI_SUM, lmp->world);
+    if (A[0] <= 0.0) return out;
+    double c[3] = {A[1] / A[0], A[2] / A[0], A[3] / A[0]}, b[2] = {0, 0}, B[2];
+    for (int i = 0; i < nlocal; i++) {
+      if (!(atom->mask[i] & groupbit)) continue;
+      double m = atom->rmass ? atom->rmass[i] : atom->mass[atom->type[i]];
+      lmp->domain->unmap(atom->x[i], atom->image[i], unwrap);
+      double *v = atom->v[i];
+      double vn = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      double rn = std::sqrt((unwrap[0] - c[0]) * (unwrap[0] - c[0]) + (unwrap[1] - c[1]) * (unwrap[1] - c[1]) +
+                            (unwrap[2] - c[2]) * (unwrap[2] - c[2]));
+      b[0] += m * vn;
+      b[1] += m * rn * vn;
+    }
+    MPI_Allreduce(b, B, 2, MPI_DOUBLE, MPI_SUM, lmp->world);
+    out.linear = B[0];
+    out.rotation = B[1];
+    return out;
+  }
+
+  void check_velocity(LAMMPS *lmp, int groupbit, bool linear, bool rotation, const VelocityScale &pre)
   {
     if (!enabled()) return;
     Atom *atom = lmp->atom;
@@ -240,7 +279,7 @@ namespace Sanitizer {
 
     if (linear) {
       double p[3] = {A[1], A[2], A[3]};
-      if (A[4] > 0.0 && vector_not_zero(p, A[4], n))
+      if (A[4] + pre.linear > 0.0 && vector_not_zero(p, A[4] + pre.linear, n))
         report("LMP-VEL-001", vec_detail("velocity", "net momentum", p, A[4]), step);
     }
 
@@ -276,10 +315,10 @@ namespace Sanitizer {
       if (MathEigen::jacobi3(inertia, eval, evec) != 0) return;
       double emax = std::fmax(eval[0], std::fmax(eval[1], eval[2]));
       double emin = std::fmin(eval[0], std::fmin(eval[1], eval[2]));
-      if (!(emin > 1.0e-6 * emax) || B[3] <= 0.0) return;
+      if (!(emin > 1.0e-6 * emax) || B[3] + pre.rotation <= 0.0) return;
       double kappa = emax / emin;
       double L[3] = {B[0], B[1], B[2]};
-      if (vector_not_zero(L, B[3] * kappa, n))
+      if (vector_not_zero(L, (B[3] + pre.rotation) * kappa, n))
         report("LMP-VEL-002", vec_detail("velocity", "net angular momentum", L, B[3]), step);
     }
   }
@@ -331,6 +370,8 @@ namespace Sanitizer {
         unwrapped(d, lmp->atom->x[i], lmp->atom->image[i], lamda, after);
       for (int k = 0; k < 3; k++) {
         double scale = std::fabs(before[3 * i + k]) + period[k];
+        // the law holds while the image count fits the image-flag bit field
+        if (std::fabs(before[3 * i + k]) >= (IMGMAX - 2) * period[k]) continue;
         if (!(std::fabs(after[k] - before[3 * i + k]) <= sum_tol(scale, 1))) {
           char buf[200];
           snprintf(buf, sizeof buf, "atom index %ld dim %d: unwrapped %.17g -> %.17g", i, k, before[3 * i + k],
@@ -480,10 +521,12 @@ namespace Sanitizer {
       int o = it->second;
 
       // GHOST-002: scalar properties are copied verbatim
+      // (only right after borders(): forward_comm refreshes positions, not these properties)
       bool same = atom->type[g] == atom->type[o];
       if (atom->q_flag) same = same && atom->q[g] == atom->q[o];
       if (atom->rmass_flag) same = same && atom->rmass[g] == atom->rmass[o];
       if (atom->radius_flag) same = same && atom->radius[g] == atom->radius[o];
+      if (strcmp(where, "borders") != 0) same = true;
       if (!same && !prop_alarm) {
         prop_alarm = true;
         snprintf(qbuf, sizeof qbuf, "%s: ghost %d differs from owner %d (tag %ld) in type/q/mass/radius", where, g, o,
@@ -686,8 +729,8 @@ namespace Sanitizer {
   // VIR-002
   // ------------------------------------------------------------------
 
-  void check_peratom_energy(LAMMPS *lmp, const double *energy, bool pairflag, bool bondflag, bool angleflag,
-                            bool dihedralflag, bool improperflag, bool kspaceflag, bool fixflag)
+  void check_peratom_energy(LAMMPS *lmp, const double *energy, int groupbit, bool pairflag, bool bondflag,
+                            bool angleflag, bool dihedralflag, bool improperflag, bool kspaceflag, bool fixflag)
   {
     if (!enabled()) return;
     Force *force = lmp->force;
@@ -697,7 +740,7 @@ namespace Sanitizer {
     if (force->kspace && kspaceflag) return;
     if (fixflag && lmp->modify->n_energy_atom) return;
     for (int i = 0; i < atom->nlocal; i++)
-      if (!(atom->mask[i] & 1)) return;    // only the full system (group all)
+      if (!(atom->mask[i] & groupbit)) return;    // the compute's group must hold every atom
 
     double want = 0.0;
     if (pairflag && force->pair && force->pair->compute_flag) want += force->pair->eng_vdwl + force->pair->eng_coul;
@@ -726,6 +769,9 @@ namespace Sanitizer {
   void check_min_descent(LAMMPS *lmp, bool monotone, double eprevious, double ecurrent)
   {
     if (!enabled() || !monotone) return;
+    // fix box/relax redefines the energy function whenever it resets its reference state
+    for (int i = 0; i < lmp->modify->nfix; i++)
+      if (!strncmp(lmp->modify->fix[i]->style, "box/relax", 9)) return;
     double scale = std::fabs(eprevious) + std::fabs(ecurrent);
     if (!(ecurrent <= eprevious + sum_tol(scale, static_cast<long>(lmp->atom->natoms)))) {
       char buf[160];
@@ -758,7 +804,7 @@ namespace Sanitizer {
   StepMonitor::Sums StepMonitor::take() const
   {
     Atom *atom = lmp->atom;
-    Sums s = {{0, 0, 0}, {0, 0, 0}, 0, 0};
+    Sums s = {{0, 0, 0}, {0, 0, 0}, 0, 0, atom->nlocal};
     for (int i = 0; i < atom->nlocal; i++) {
       double m = atom->rmass ? atom->rmass[i] : atom->mass[atom->type[i]];
       for (int k = 0; k < 3; k++) {
@@ -786,6 +832,7 @@ namespace Sanitizer {
   {
     if (!armed) return;
     Sums s2 = take();
+    if (s0.nlocal != s1.nlocal || s0.nlocal != s2.nlocal) return;    // atoms lost or added: momentum leaves with them
     double dtf = 0.5 * lmp->update->dt * lmp->force->ftm2v;
     double resid[3];
     for (int k = 0; k < 3; k++) resid[k] = (s2.p[k] - s0.p[k]) - dtf * (s0.f[k] + s1.f[k]);
@@ -899,13 +946,16 @@ namespace Sanitizer {
       double eval[3], evec[3][3];
       if (MathEigen::jacobi3(cov, eval, evec) != 0) return;
       double emax = std::fmax(eval[0], std::fmax(eval[1], eval[2]));
-      double floor_ = m[b] * (64.0 * EPS64 * (R + 1.0)) * (64.0 * EPS64 * (R + 1.0));    // rounding noise in r
+      // rounding noise: coordinates carry eps*R, so entries of the covariance carry m*eps*R*r_body (first order)
+      double rbody = std::sqrt(emax / m[b]);
+      double floor_ = 64.0 * EPS64 * (emax + m[b] * (R + 1.0) * rbody) + m[b] * (64.0 * EPS64 * (R + 1.0)) * (64.0 * EPS64 * (R + 1.0));
       int rank = 0;
       for (double e : eval) {
         if (e <= floor_) continue;                       // clearly zero
         if (e < 1.0e-4 * emax) return;                   // ambiguous band: no verdict
         rank++;
       }
+      if (rank == 0 && count[b] > 1) return;    // all atoms coincide: no rigid body geometry
       int true_dof = rank == 0 ? 3 : (rank == 1 ? 5 : 6);
       expected += 3LL * count[b] - true_dof;
     }
