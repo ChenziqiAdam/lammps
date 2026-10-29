@@ -111,7 +111,17 @@ namespace Sanitizer {
       loc[8] += xm;
     }
     MPI_Allreduce(loc, all, 9, MPI_DOUBLE, MPI_SUM, lmp->world);
+    // extent of the owned atoms (a length scale for the energy-based force scale)
+    double ext[6] = {-1.0e300, -1.0e300, -1.0e300, -1.0e300, -1.0e300, -1.0e300}, extall[6];
+    for (int i = 0; i < atom->nlocal; i++)
+      for (int k = 0; k < 3; k++) {
+        ext[k] = std::fmax(ext[k], x[i][k]);
+        ext[3 + k] = std::fmax(ext[3 + k], -x[i][k]);
+      }
+    MPI_Allreduce(ext, extall, 6, MPI_DOUBLE, MPI_MAX, lmp->world);
     Snap s;
+    s.span = 0.0;
+    for (int k = 0; k < 3; k++) s.span = std::fmax(s.span, extall[k] + extall[3 + k]);
     for (int k = 0; k < 3; k++) {
       s.f[k] = all[k];
       s.t[k] = all[3 + k];
@@ -194,21 +204,36 @@ namespace Sanitizer {
     // sum|f| before + after bounds sum|delta f| (triangle inequality)
     double fscale = s1.fscale + s0.fscale;
     double tscale = s1.tscale + s0.tscale;
-    // Net per-atom forces vanish in a relaxed or symmetric configuration while the pair terms
-    // that summed to them do not. The pair energy over the cutoff is a force scale for those
-    // terms (energies are only tallied on some steps: the last tallied value is kept).
-    if (stage == PAIR && lmp->force->pair) {
+    // Net per-atom forces vanish in a relaxed or symmetric configuration while the terms
+    // that summed to them do not. The energy of the stage over a length (the interaction range,
+    // bounded by the extent of the system) is a force scale for those terms (energies are only
+    // tallied on some steps: the last tallied value is kept).
+    {
       static LAMMPS *owner = nullptr;
-      static double f_energy = 0.0;
+      static double e_last[5] = {0, 0, 0, 0, 0};
       static long long last_step = -1;
-      Pair *pair = lmp->force->pair;
       long long now = lmp->update->ntimestep;
-      if (owner != lmp || now < last_step) { owner = lmp; f_energy = 0.0; }
+      if (owner != lmp || now < last_step) {
+        owner = lmp;
+        for (double &e : e_last) e = 0.0;
+      }
       last_step = now;
-      if (lmp->update->eflag_global == now && pair->cutforce > 0.0)
-        f_energy = 4.0 * (std::fabs(pair->eng_vdwl) + std::fabs(pair->eng_coul)) / pair->cutforce;
-      fscale += f_energy;
-      tscale += f_energy * s1.xsum;
+      Force *fc = lmp->force;
+      double e = -1.0, range = lmp->neighbor->cutneighmax;
+      if (stage == PAIR && fc->pair) {
+        e = std::fabs(fc->pair->eng_vdwl) + std::fabs(fc->pair->eng_coul);
+        range = fc->pair->cutforce;
+      } else if (stage == BOND && fc->bond) e = std::fabs(fc->bond->energy);
+      else if (stage == ANGLE && fc->angle) e = std::fabs(fc->angle->energy);
+      else if (stage == DIHEDRAL && fc->dihedral) e = std::fabs(fc->dihedral->energy);
+      else if (stage == IMPROPER && fc->improper) e = std::fabs(fc->improper->energy);
+      if (e >= 0.0 && lmp->update->eflag_global == now) e_last[stage] = 4.0 * e;
+      if (s1.span > 0.0) range = std::fmin(range > 0.0 ? range : s1.span, s1.span);
+      if (range > 0.0) {
+        double f_energy = e_last[stage] / range;
+        fscale += f_energy;
+        tscale += f_energy * s1.xsum;
+      }
     }
     long long step = lmp->update->ntimestep;
     if (stage == PAIR) check_pair_virial(n);
@@ -557,6 +582,11 @@ namespace Sanitizer {
     double pmin = x_is_lamda ? 1.0 : std::fmin(d->xprd, std::fmin(d->yprd, d->zprd));
     double ntol = sum_tol(1.0, 1) * (xmax / pmin + 1.0);
 
+    auto in_border = [&](const char *name) {
+      const auto &fb = atom->avec->fields_border;
+      return std::find(fb.begin(), fb.end(), std::string(name)) != fb.end();
+    };
+    bool border_q = in_border("q"), border_rmass = in_border("rmass"), border_radius = in_border("radius");
     bool pos_alarm = false, prop_alarm = false;
     char pbuf[220] = "", qbuf[220] = "";
     for (int g = nlocal; g < nall; g++) {
@@ -567,9 +597,10 @@ namespace Sanitizer {
       // GHOST-002: scalar properties are copied verbatim
       // (only right after borders(): forward_comm refreshes positions, not these properties)
       bool same = atom->type[g] == atom->type[o];
-      if (atom->q_flag) same = same && atom->q[g] == atom->q[o];
-      if (atom->rmass_flag) same = same && atom->rmass[g] == atom->rmass[o];
-      if (atom->radius_flag) same = same && atom->radius[g] == atom->radius[o];
+      // only properties the atom style itself communicates (fix property/atom ghost no does not)
+      if (atom->q_flag && border_q) same = same && atom->q[g] == atom->q[o];
+      if (atom->rmass_flag && border_rmass) same = same && atom->rmass[g] == atom->rmass[o];
+      if (atom->radius_flag && border_radius) same = same && atom->radius[g] == atom->radius[o];
       if (strcmp(where, "borders") != 0) same = true;
       if (!same && !prop_alarm) {
         prop_alarm = true;
@@ -633,6 +664,8 @@ namespace Sanitizer {
       bool dup = false, self = false;
       std::set<std::array<long long, 5>> seen_pairs;
       bool effective_newton = r.newton_on;
+      // displacement resolution: 1e-6 of the neighbor range (an absolute length breaks in si/cgs units)
+      const double key_unit = 1.0e-6 * (lmp->neighbor->cutneighmax > 0.0 ? lmp->neighbor->cutneighmax : 1.0);
       for (int ii = 0; ii < l->inum && !(dup || self); ii++) {
         int i = l->ilist[ii];
         std::vector<int> row(l->firstneigh[i], l->firstneigh[i] + l->numneigh[i]);
@@ -651,7 +684,7 @@ namespace Sanitizer {
               if (ti == tj) flip = dd[0] < 0.0 || (dd[0] == 0.0 && (dd[1] < 0.0 || (dd[1] == 0.0 && dd[2] < 0.0)));
               std::array<long long, 5> key = {static_cast<long long>(std::min(ti, tj)),
                                               static_cast<long long>(std::max(ti, tj)), 0, 0, 0};
-              for (int k = 0; k < 3; k++) key[2 + k] = std::llround((flip ? -dd[k] : dd[k]) * 1.0e6);
+              for (int k = 0; k < 3; k++) key[2 + k] = std::llround((flip ? -dd[k] : dd[k]) / key_unit);
               if (!seen_pairs.insert(key).second) dup = true;
             }
       }
@@ -1005,7 +1038,8 @@ namespace Sanitizer {
       double emax = std::fmax(eval[0], std::fmax(eval[1], eval[2]));
       // rounding noise: coordinates carry eps*R, so entries of the covariance carry m*eps*R*r_body (first order)
       double rbody = std::sqrt(emax / m[b]);
-      double floor_ = 64.0 * EPS64 * (emax + m[b] * (R + 1.0) * rbody) + m[b] * (64.0 * EPS64 * (R + 1.0)) * (64.0 * EPS64 * (R + 1.0));
+      double Rr = std::fmax(R, rbody);
+      double floor_ = 64.0 * EPS64 * (emax + m[b] * Rr * rbody) + m[b] * (64.0 * EPS64 * Rr) * (64.0 * EPS64 * Rr);
       int rank = 0;
       for (double e : eval) {
         if (e <= floor_) continue;                       // clearly zero

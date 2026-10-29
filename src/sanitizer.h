@@ -38,7 +38,7 @@ namespace Sanitizer {
 
    private:
     struct Snap {
-      double f[3], t[3], fscale, tscale, xsum;
+      double f[3], t[3], fscale, tscale, xsum, span;
     };
     Snap take(Stage stage, long &natoms) const;
     void check_pair_virial(long natoms);
