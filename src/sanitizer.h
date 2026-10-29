@@ -38,7 +38,7 @@ namespace Sanitizer {
 
    private:
     struct Snap {
-      double f[3], t[3], fscale, tscale;
+      double f[3], t[3], fscale, tscale, xsum;
     };
     Snap take(Stage stage, long &natoms) const;
     void check_pair_virial(long natoms);
@@ -159,7 +159,7 @@ namespace Sanitizer {
   // RIGID-003: degrees of freedom removed by `fix rigid` match the body geometry
   // (3 for one atom, 5 for collinear atoms, 6 otherwise). `removed` is what FixRigid::dof returned.
   void check_rigid_dof(LAMMPS *lmp, int nbody, const int *body, const int *nrigid, int tgroupbit, bool extended,
-                       long long removed);
+                       bool from_file, long long removed);
 
 }    // namespace Sanitizer
 }    // namespace LAMMPS_NS

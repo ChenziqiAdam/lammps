@@ -96,7 +96,7 @@ namespace Sanitizer {
     int nsum = newton ? atom->nlocal + atom->nghost : atom->nlocal;
     double **x = atom->x;
     double **f = atom->f;
-    double loc[8] = {0, 0, 0, 0, 0, 0, 0, 0}, all[8];
+    double loc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, all[9];
     for (int i = 0; i < nsum; i++) {
       loc[0] += f[i][0];
       loc[1] += f[i][1];
@@ -108,8 +108,9 @@ namespace Sanitizer {
       double xm = std::sqrt(x[i][0] * x[i][0] + x[i][1] * x[i][1] + x[i][2] * x[i][2]);
       loc[6] += fm;
       loc[7] += xm * fm;
+      loc[8] += xm;
     }
-    MPI_Allreduce(loc, all, 8, MPI_DOUBLE, MPI_SUM, lmp->world);
+    MPI_Allreduce(loc, all, 9, MPI_DOUBLE, MPI_SUM, lmp->world);
     Snap s;
     for (int k = 0; k < 3; k++) {
       s.f[k] = all[k];
@@ -117,6 +118,7 @@ namespace Sanitizer {
     }
     s.fscale = all[6];
     s.tscale = all[7];
+    s.xsum = all[8];
     natoms = static_cast<long>(atom->natoms);
     return s;
   }
@@ -138,7 +140,10 @@ namespace Sanitizer {
   void ForceStage::check_pair_virial(long natoms)
   {
     Pair *pair = lmp->force->pair;
-    if (!pair || !lmp->force->newton_pair || !pair->vflag_global) return;    // vflag_global != 0: tallied, not fdotr
+    if (!pair || !lmp->force->newton_pair || !pair->vflag_global) return;
+    // hbond/dreiding looks its hydrogen up through atom->map (any periodic image) while it tallies
+    // minimum-image vectors: its two virial routes legitimately differ
+    if (lmp->force->pair_match("hbond", 0) != nullptr) return;    // vflag_global != 0: tallied, not fdotr
     Atom *atom = lmp->atom;
     int nall = atom->nlocal + atom->nghost;
     if (f_before.size() != 3 * static_cast<size_t>(nall)) return;
@@ -186,6 +191,22 @@ namespace Sanitizer {
     // sum|f| before + after bounds sum|delta f| (triangle inequality)
     double fscale = s1.fscale + s0.fscale;
     double tscale = s1.tscale + s0.tscale;
+    // Net per-atom forces vanish in a relaxed or symmetric configuration while the pair terms
+    // that summed to them do not. The pair energy over the cutoff is a force scale for those
+    // terms (energies are only tallied on some steps: the last tallied value is kept).
+    if (stage == PAIR && lmp->force->pair) {
+      static LAMMPS *owner = nullptr;
+      static double f_energy = 0.0;
+      static long long last_step = -1;
+      Pair *pair = lmp->force->pair;
+      long long now = lmp->update->ntimestep;
+      if (owner != lmp || now < last_step) { owner = lmp; f_energy = 0.0; }
+      last_step = now;
+      if (lmp->update->eflag_global == now && pair->cutforce > 0.0)
+        f_energy = 4.0 * (std::fabs(pair->eng_vdwl) + std::fabs(pair->eng_coul)) / pair->cutforce;
+      fscale += f_energy;
+      tscale += f_energy * s1.xsum;
+    }
     long long step = lmp->update->ntimestep;
     if (stage == PAIR) check_pair_virial(n);
 
@@ -371,7 +392,8 @@ namespace Sanitizer {
       for (int k = 0; k < 3; k++) {
         double scale = std::fabs(before[3 * i + k]) + period[k];
         // the law holds while the image count fits the image-flag bit field
-        if (std::fabs(before[3 * i + k]) >= (IMGMAX - 2) * period[k]) continue;
+        double origin = lamda ? 0.0 : d->boxlo[k];
+        if (std::fabs(before[3 * i + k] - origin) >= (IMGMAX - 2) * period[k]) continue;
         if (!(std::fabs(after[k] - before[3 * i + k]) <= sum_tol(scale, 1))) {
           char buf[200];
           snprintf(buf, sizeof buf, "atom index %ld dim %d: unwrapped %.17g -> %.17g", i, k, before[3 * i + k],
@@ -587,7 +609,7 @@ namespace Sanitizer {
 
       // NBR-002: no self pair, no repeated neighbor, no pair stored from both sides
       bool dup = false, self = false;
-      std::unordered_set<long long> seen_pairs;
+      std::set<std::array<long long, 5>> seen_pairs;
       bool effective_newton = r.newton_on;
       for (int ii = 0; ii < l->inum && !(dup || self); ii++) {
         int i = l->ilist[ii];
@@ -599,8 +621,15 @@ namespace Sanitizer {
         if (std::adjacent_find(row.begin(), row.end()) != row.end()) dup = true;
         if (!r.full && effective_newton)
           for (int j : row)
-            if (j < nlocal) {
-              long long key = static_cast<long long>(std::min(i, j)) * nall + std::max(i, j);
+            if (atom->tag_enable) {
+              // physical pair = (tag pair, displacement oriented from the lower tag); owned-ghost pairs included
+              double dd[3] = {x[j][0] - x[i][0], x[j][1] - x[i][1], x[j][2] - x[i][2]};
+              tagint ti = atom->tag[i], tj = atom->tag[j];
+              bool flip = ti > tj;
+              if (ti == tj) flip = dd[0] < 0.0 || (dd[0] == 0.0 && (dd[1] < 0.0 || (dd[1] == 0.0 && dd[2] < 0.0)));
+              std::array<long long, 5> key = {static_cast<long long>(std::min(ti, tj)),
+                                              static_cast<long long>(std::max(ti, tj)), 0, 0, 0};
+              for (int k = 0; k < 3; k++) key[2 + k] = std::llround((flip ? -dd[k] : dd[k]) * 1.0e6);
               if (!seen_pairs.insert(key).second) dup = true;
             }
       }
@@ -646,13 +675,17 @@ namespace Sanitizer {
             if (rsq < c * (1.0 - 1.0e-12)) ++lower;
             if (rsq <= c * (1.0 + 1.0e-12)) ++upper;
           }
-        if (stored < lower / 2) {
+        if (2 * stored > upper) {
+          char buf[160];
+          snprintf(buf, sizeof buf, "list %d (half): %ld pairs stored, at most %lld inside the cutoff", m, stored,
+                   upper / 2);
+          report("LMP-NBR-001", buf, step);
+        } else if (2 * stored < lower) {
           char buf[160];
           snprintf(buf, sizeof buf, "list %d (half): %ld pairs stored, at least %lld inside the cutoff", m, stored,
                    lower / 2);
           report("LMP-NBR-001", buf, step);
         }
-        (void) upper;
       }
     next_list:;
     }
@@ -773,7 +806,8 @@ namespace Sanitizer {
     for (int i = 0; i < lmp->modify->nfix; i++)
       if (!strncmp(lmp->modify->fix[i]->style, "box/relax", 9)) return;
     double scale = std::fabs(eprevious) + std::fabs(ecurrent);
-    if (!(ecurrent <= eprevious + sum_tol(scale, static_cast<long>(lmp->atom->natoms)))) {
+    // the quadratic line search accepts a rise below EMACH = 1e-8 by design (min_linesearch.cpp)
+    if (!(ecurrent <= eprevious + 1.0e-8 + sum_tol(scale, static_cast<long>(lmp->atom->natoms)))) {
       char buf[160];
       snprintf(buf, sizeof buf, "line search accepted a step raising the energy: %.17g -> %.17g", eprevious, ecurrent);
       report("LMP-MIN-001", buf, lmp->update->ntimestep);
@@ -905,9 +939,10 @@ namespace Sanitizer {
   // ------------------------------------------------------------------
 
   void check_rigid_dof(LAMMPS *lmp, int nbody, const int *body, const int *nrigid, int tgroupbit, bool extended,
-                       long long removed)
+                       bool from_file, long long removed)
   {
-    if (!enabled() || extended || lmp->domain->dimension != 3 || nbody == 0) return;
+    // a body read from an infile may carry its own inertia: its dof count follows that, not the atom geometry
+    if (!enabled() || extended || from_file || lmp->domain->dimension != 3 || nbody == 0) return;
     Atom *atom = lmp->atom;
     if (lmp->comm->nprocs != 1) return;
     int nlocal = atom->nlocal;

@@ -1276,7 +1276,7 @@ bigint FixRigid::dof(int tgroup)
   delete[] nall;
   delete[] mall;
 
-  Sanitizer::check_rigid_dof(lmp, nbody, body, nrigid, tgroupbit, extended != 0, n);
+  Sanitizer::check_rigid_dof(lmp, nbody, body, nrigid, tgroupbit, extended != 0, inpfile != nullptr, n);
 
   return n;
 }
