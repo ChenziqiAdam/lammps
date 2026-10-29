@@ -29,6 +29,7 @@
 #include "memory.h"
 #include "neighbor.h"
 #include "pair.h"
+#include "sanitizer.h"
 
 #include <cmath>
 #include <cstring>
@@ -484,6 +485,10 @@ int CommBrick::updown(int dim, int dir, int loc, double prd, int periodicity, do
 
 void CommBrick::forward_comm(int /*dummy*/)
 {
+  struct GhostCheckAtExit {
+    LAMMPS *lmp;
+    ~GhostCheckAtExit() { Sanitizer::check_ghosts(lmp, false, "forward_comm"); }
+  } sanitize_ghost_check{lmp};
   int n;
   MPI_Request request;
   AtomVec *avec = atom->avec;
@@ -896,6 +901,8 @@ void CommBrick::borders()
   // reset global->local map
 
   if (map_style != Atom::MAP_NONE) atom->map_set();
+
+  Sanitizer::check_ghosts(lmp, domain->triclinic != 0, "borders");
 }
 
 /* ----------------------------------------------------------------------

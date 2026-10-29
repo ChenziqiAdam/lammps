@@ -17,6 +17,7 @@
 #include "error.h"
 #include "output.h"
 #include "timer.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cmath>
@@ -75,6 +76,7 @@ int MinCG::iterate(int maxiter)
     eprevious = ecurrent;
     fail = (this->*linemin)(ecurrent,alpha_final);
     if (fail) return fail;
+    Sanitizer::check_min_descent(lmp, linestyle != FORCEZERO, eprevious, ecurrent);
 
     // function evaluation criterion
 

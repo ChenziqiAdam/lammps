@@ -25,6 +25,7 @@
 #include "memory.h"
 #include "modify.h"
 #include "pair.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cstring>
@@ -176,6 +177,9 @@ void ComputePEAtom::compute_peratom()
 
   for (i = 0; i < nlocal; i++)
     if (!(mask[i] & groupbit)) energy[i] = 0.0;
+
+  Sanitizer::check_peratom_energy(lmp, energy, pairflag, bondflag, angleflag, dihedralflag, improperflag,
+                                  kspaceflag, fixflag);
 }
 
 /* ---------------------------------------------------------------------- */

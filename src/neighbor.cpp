@@ -50,6 +50,7 @@
 #include "style_ntopo.h"  // IWYU pragma: keep
 #include "suffix.h"
 #include "tokenizer.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cmath>
@@ -2619,6 +2620,21 @@ void Neighbor::build(int topoflag)
       lists[m]->grow(nlocal, nall);
     neigh_pair[m]->build_setup();
     neigh_pair[m]->build(lists[m]);
+  }
+
+  if (Sanitizer::enabled()) {
+    std::vector<Sanitizer::ListInfo> infos;
+    // requests[] is emptied once the lists exist; old_requests[] keeps the same flags, same order
+    for (m = 0; m < nlist && m < old_nrequest; m++) {
+      NeighRequest *r = old_requests[m];
+      if (!r || !lists[m]) continue;
+      bool plain = r->pair && !r->occasional && !r->ghost && !r->size && !r->history && !r->skip && !r->molskip &&
+          !r->cut && !r->bond && !r->respainner && !r->respaouter && !r->ssa && !r->trim && !r->copy &&
+          !r->halffull && (r->half || r->full);
+      bool newton_on = r->newton == 0 ? force->newton_pair != 0 : r->newton == 1;
+      infos.push_back({lists[m], m, plain, r->full != 0, newton_on});
+    }
+    Sanitizer::check_neighbor_lists(lmp, infos);
   }
 
   // build topology lists for bonds/angles/etc

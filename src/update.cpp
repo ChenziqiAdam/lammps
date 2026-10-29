@@ -23,6 +23,7 @@
 #include "modify.h"
 #include "neighbor.h"
 #include "output.h"
+#include "sanitizer.h"
 
 #include <cstring>
 
@@ -300,6 +301,15 @@ void Update::set_units(const char *style)
 
   } else
     error->all(FLERR, "Unknown units style {}", style);
+
+  if (Sanitizer::enabled()) {
+    Sanitizer::UnitConstants uc{force->boltz,  force->hplanck,     force->mvv2e,
+                                force->ftm2v,  force->nktv2p,      force->qqr2e,
+                                force->angstrom, force->femtosecond, force->qelectron};
+    for (const auto &v : Sanitizer::unit_violations(style, uc))
+      Sanitizer::report(v.id, fmt::format("units {}: {} = {:.10g}, expected {:.10g}", style, v.what,
+                                          v.actual, v.expected));
+  }
 
   delete[] unit_style;
   unit_style = utils::strdup(style);

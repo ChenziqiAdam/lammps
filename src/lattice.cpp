@@ -19,6 +19,7 @@
 #include "error.h"
 #include "math_extra.h"
 #include "memory.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cmath>
@@ -297,7 +298,9 @@ Lattice::Lattice(LAMMPS *lmp, int narg, char **arg) : Pointers(lmp)
   // scale = (Nbasis/(Vprimitive * rho*)) ^ (1/dim)
   // use fabs() in case a1,a2,a3 are not right-handed for general triclinic
 
+  double rho_requested = 0.0;
   if (strcmp(update->unit_style,"lj") == 0) {
+    rho_requested = scale;
     double vec[3];
     MathExtra::cross3(a2,a3,vec);
     double volume = fabs(MathExtra::dot3(a1,vec));
@@ -307,6 +310,8 @@ Lattice::Lattice(LAMMPS *lmp, int narg, char **arg) : Pointers(lmp)
   // initialize lattice <-> box transformation matrices
 
   setup_transform(a1,a2,a3);
+
+  Sanitizer::check_lattice_density(lmp, this, rho_requested, nbasis);
 
   // automatic calculation of lattice spacings
   // convert 8 corners of primitive unit cell from lattice coords to box coords

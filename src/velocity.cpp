@@ -26,6 +26,7 @@
 #include "memory.h"
 #include "modify.h"
 #include "random_park.h"
+#include "sanitizer.h"
 #include "variable.h"
 
 #include <cmath>
@@ -395,6 +396,9 @@ void Velocity::create(double t_desired, int seed)
   // free local memory
   // if temperature compute was created, delete it
 
+  // sanitizer: momentum / angular momentum of the new velocities
+  if (!sum_flag && !bias_flag) Sanitizer::check_velocity(lmp, groupbit, momentum_flag, rotation_flag);
+
   delete random;
   if (tcreate_flag) modify->delete_compute("velocity_temp");
   if (temperature_nobias) modify->delete_compute("velocity_temp");
@@ -689,8 +693,10 @@ void Velocity::ramp(int /*narg*/, char **arg)
 void Velocity::zero(int /*narg*/, char **arg)
 {
   if (strcmp(arg[0],"linear") == 0) {
-    if (!rigid_fix) zero_momentum();
-    else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
+    if (!rigid_fix) {
+      zero_momentum();
+      Sanitizer::check_velocity(lmp, groupbit, true, false);
+    } else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
       rigid_fix->setup_pre_neighbor();
       rigid_fix->zero_momentum();
     } else if (utils::strmatch(rigid_fix->style,"^rigid")) {
@@ -698,8 +704,10 @@ void Velocity::zero(int /*narg*/, char **arg)
     } else error->all(FLERR,"Velocity rigid used with non-rigid fix-ID {}", rigid_fix->id);
 
   } else if (strcmp(arg[0],"angular") == 0) {
-    if (!rigid_fix) zero_rotation();
-    else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
+    if (!rigid_fix) {
+      zero_rotation();
+      Sanitizer::check_velocity(lmp, groupbit, false, true);
+    } else if (utils::strmatch(rigid_fix->style,"^rigid/small")) {
       rigid_fix->setup_pre_neighbor();
       rigid_fix->zero_rotation();
     } else if (utils::strmatch(rigid_fix->style,"^rigid")) {

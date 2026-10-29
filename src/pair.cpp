@@ -32,6 +32,7 @@
 #include "neighbor.h"
 #include "safe_pointers.h"
 #include "suffix.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cfloat>     // IWYU pragma: keep
@@ -815,13 +816,15 @@ double Pair::mix_energy(double eps1, double eps2, double sig1, double sig2)
 
 double Pair::mix_distance(double sig1, double sig2)
 {
+  double result = 0.0;
   if (mix_flag == GEOMETRIC)
-    return sqrt(sig1*sig2);
+    result = sqrt(sig1*sig2);
   else if (mix_flag == ARITHMETIC)
-    return (0.5 * (sig1+sig2));
+    result = (0.5 * (sig1+sig2));
   else if (mix_flag == SIXTHPOWER)
-    return pow((0.5 * (powint(sig1, 6) + powint(sig2, 6))), 1.0/6.0);
-  else return 0.0;
+    result = pow((0.5 * (powint(sig1, 6) + powint(sig2, 6))), 1.0/6.0);
+  Sanitizer::check_mix_distance(sig1, sig2, result);
+  return result;
 }
 
 /* ---------------------------------------------------------------------- */

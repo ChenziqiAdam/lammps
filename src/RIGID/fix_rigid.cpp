@@ -33,6 +33,7 @@
 #include "rigid_const.h"
 #include "safe_pointers.h"
 #include "tokenizer.h"
+#include "sanitizer.h"
 #include "update.h"
 #include "variable.h"
 
@@ -894,6 +895,8 @@ void FixRigid::initial_integrate(int vflag)
   // from quarternion and omega
 
   set_xv();
+
+  Sanitizer::check_rigid_shape(lmp, body, displace, xcmimage, xcm);
 }
 
 /* ----------------------------------------------------------------------
@@ -1272,6 +1275,8 @@ bigint FixRigid::dof(int tgroup)
   delete[] mcount;
   delete[] nall;
   delete[] mall;
+
+  Sanitizer::check_rigid_dof(lmp, nbody, body, nrigid, tgroupbit, extended != 0, n);
 
   return n;
 }

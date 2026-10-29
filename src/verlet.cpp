@@ -31,6 +31,7 @@
 #include "output.h"
 #include "pair.h"
 #include "timer.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cstring>
@@ -134,17 +135,18 @@ void Verlet::setup(int flag)
 
   force->setup();
   ev_set(update->ntimestep);
+  Sanitizer::ForceStage sfs(lmp);
   force_clear();
   modify->setup_pre_force(vflag);
 
-  if (pair_compute_flag) force->pair->compute(eflag,vflag);
+  if (pair_compute_flag) { sfs.before(Sanitizer::ForceStage::PAIR); force->pair->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::PAIR); }
   else if (force->pair) force->pair->compute_dummy(eflag,vflag);
 
   if (atom->molecular != Atom::ATOMIC) {
-    if (force->bond) force->bond->compute(eflag,vflag);
-    if (force->angle) force->angle->compute(eflag,vflag);
-    if (force->dihedral) force->dihedral->compute(eflag,vflag);
-    if (force->improper) force->improper->compute(eflag,vflag);
+    if (force->bond) { sfs.before(Sanitizer::ForceStage::BOND); force->bond->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::BOND); }
+    if (force->angle) { sfs.before(Sanitizer::ForceStage::ANGLE); force->angle->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::ANGLE); }
+    if (force->dihedral) { sfs.before(Sanitizer::ForceStage::DIHEDRAL); force->dihedral->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::DIHEDRAL); }
+    if (force->improper) { sfs.before(Sanitizer::ForceStage::IMPROPER); force->improper->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::IMPROPER); }
   }
 
   if (force->kspace) {
@@ -196,17 +198,18 @@ void Verlet::setup_minimal(int flag)
   // compute all forces
 
   ev_set(update->ntimestep);
+  Sanitizer::ForceStage sfs(lmp);
   force_clear();
   modify->setup_pre_force(vflag);
 
-  if (pair_compute_flag) force->pair->compute(eflag,vflag);
+  if (pair_compute_flag) { sfs.before(Sanitizer::ForceStage::PAIR); force->pair->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::PAIR); }
   else if (force->pair) force->pair->compute_dummy(eflag,vflag);
 
   if (atom->molecular != Atom::ATOMIC) {
-    if (force->bond) force->bond->compute(eflag,vflag);
-    if (force->angle) force->angle->compute(eflag,vflag);
-    if (force->dihedral) force->dihedral->compute(eflag,vflag);
-    if (force->improper) force->improper->compute(eflag,vflag);
+    if (force->bond) { sfs.before(Sanitizer::ForceStage::BOND); force->bond->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::BOND); }
+    if (force->angle) { sfs.before(Sanitizer::ForceStage::ANGLE); force->angle->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::ANGLE); }
+    if (force->dihedral) { sfs.before(Sanitizer::ForceStage::DIHEDRAL); force->dihedral->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::DIHEDRAL); }
+    if (force->improper) { sfs.before(Sanitizer::ForceStage::IMPROPER); force->improper->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::IMPROPER); }
   }
 
   if (force->kspace) {
@@ -230,6 +233,7 @@ void Verlet::run(int n)
 {
   bigint ntimestep;
   int nflag,sortflag;
+  Sanitizer::StepMonitor sanitize_step(lmp);
 
   int n_post_integrate = modify->n_post_integrate;
   int n_pre_exchange = modify->n_pre_exchange;
@@ -255,6 +259,7 @@ void Verlet::run(int n)
     // initial time integration
 
     timer->stamp();
+    sanitize_step.begin();
     modify->initial_integrate(vflag);
     if (n_post_integrate) modify->post_integrate();
     timer->stamp(Timer::MODIFY);
@@ -303,7 +308,8 @@ void Verlet::run(int n)
     // since some bonded potentials tally pairwise energy/virial
     // and Pair:ev_tally() needs to be called before any tallying
 
-    force_clear();
+    Sanitizer::ForceStage sfs(lmp);
+  force_clear();
 
     timer->stamp();
 
@@ -313,15 +319,15 @@ void Verlet::run(int n)
     }
 
     if (pair_compute_flag) {
-      force->pair->compute(eflag,vflag);
+      { sfs.before(Sanitizer::ForceStage::PAIR); force->pair->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::PAIR); }
       timer->stamp(Timer::PAIR);
     }
 
     if (atom->molecular != Atom::ATOMIC) {
-      if (force->bond) force->bond->compute(eflag,vflag);
-      if (force->angle) force->angle->compute(eflag,vflag);
-      if (force->dihedral) force->dihedral->compute(eflag,vflag);
-      if (force->improper) force->improper->compute(eflag,vflag);
+      if (force->bond) { sfs.before(Sanitizer::ForceStage::BOND); force->bond->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::BOND); }
+      if (force->angle) { sfs.before(Sanitizer::ForceStage::ANGLE); force->angle->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::ANGLE); }
+      if (force->dihedral) { sfs.before(Sanitizer::ForceStage::DIHEDRAL); force->dihedral->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::DIHEDRAL); }
+      if (force->improper) { sfs.before(Sanitizer::ForceStage::IMPROPER); force->improper->compute(eflag,vflag); sfs.after(Sanitizer::ForceStage::IMPROPER); }
       timer->stamp(Timer::BOND);
     }
 
@@ -345,7 +351,9 @@ void Verlet::run(int n)
     // force modifications, final time integration, diagnostics
 
     if (n_post_force_any) modify->post_force(vflag);
+    sanitize_step.mid();
     modify->final_integrate();
+    sanitize_step.end();
     if (n_end_of_step) modify->end_of_step();
     timer->stamp(Timer::MODIFY);
 

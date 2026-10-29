@@ -23,6 +23,7 @@
 #include "force.h"
 #include "memory.h"
 #include "modify.h"
+#include "sanitizer.h"
 
 using namespace LAMMPS_NS;
 
@@ -56,6 +57,7 @@ Special::~Special()
 
 void Special::build()
 {
+  Sanitizer::SpecialGuard sanitize_special(lmp);
   MPI_Barrier(world);
   double time1 = platform::walltime();
 

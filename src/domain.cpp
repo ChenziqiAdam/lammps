@@ -35,6 +35,7 @@
 #include "region.h"
 #include "thermo.h"
 #include "universe.h"
+#include "sanitizer.h"
 #include "update.h"
 
 #include <cstring>
@@ -588,6 +589,8 @@ void Domain::define_general_triclinic(double *avec_caller, double *bvec_caller,
   xy = bprime[0];
   xz = cprime[0];
   yz = cprime[1];
+
+  Sanitizer::check_general_triclinic(lmp, avec, bvec, cvec, aprime, bprime, cprime);
 }
 
 /* ----------------------------------------------------------------------
@@ -763,6 +766,7 @@ void Domain::pbc()
 {
   int nlocal = atom->nlocal;
   if (!nlocal) return;
+  Sanitizer::UnwrapGuard sanitize_unwrap(lmp, "LMP-PBC-001");
   int i;
   imageint idim,otherdims;
   double *lo,*hi,*period;
@@ -1215,6 +1219,7 @@ static constexpr double MAXIMGCOUNT = 16;
 void Domain::minimum_image(const std::string &file, int line, double &dx, double &dy,
                            double &dz) const
 {
+  Sanitizer::MinImageGuard sanitize_minimage(lmp, dx, dy, dz);
   if (triclinic == 0) {
     if (xperiodic) {
       if (fabs(dx) > (MAXIMGCOUNT * xprd))
@@ -1542,6 +1547,7 @@ void Domain::closest_image(const double * const xi, const double * const xj, dou
 
 void Domain::remap(double *x, imageint &image)
 {
+  Sanitizer::UnwrapGuard sanitize_unwrap(lmp, "LMP-PBC-002", x, &image);
   double *lo,*hi,*period,*coord;
   double lamda[3];
   imageint idim,otherdims;
