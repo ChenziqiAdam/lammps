@@ -143,7 +143,10 @@ namespace Sanitizer {
     if (!pair || !lmp->force->newton_pair || !pair->vflag_global) return;
     // hbond/dreiding looks its hydrogen up through atom->map (any periodic image) while it tallies
     // minimum-image vectors: its two virial routes legitimately differ
-    if (lmp->force->pair_match("hbond", 0) != nullptr) return;    // vflag_global != 0: tallied, not fdotr
+    if (lmp->force->pair_match("hbond", 0) != nullptr) return;
+    // MSM with its default scalar-pressure mode deliberately leaves the long-range part out of the
+    // pairwise virial (documented approximation): the two routes differ by design
+    if (lmp->force->kspace && lmp->force->kspace->scalar_pressure_flag) return;    // vflag_global != 0: tallied, not fdotr
     Atom *atom = lmp->atom;
     int nall = atom->nlocal + atom->nghost;
     if (f_before.size() != 3 * static_cast<size_t>(nall)) return;
