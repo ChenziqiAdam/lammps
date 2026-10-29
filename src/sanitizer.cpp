@@ -281,7 +281,7 @@ namespace Sanitizer {
     long long step = lmp->update->ntimestep;
 
     // pass 1: mass, momentum, sum m|v|, mass-weighted unwrapped position, count
-    double a[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, A[9];
+    double a[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, A[10];
     double unwrap[3];
     for (int i = 0; i < nlocal; i++) {
       if (!(mask[i] & groupbit)) continue;
@@ -296,14 +296,33 @@ namespace Sanitizer {
       a[6] += m * unwrap[1];
       a[7] += m * unwrap[2];
       a[8] += 1.0;
+      a[9] += m * std::sqrt(unwrap[0] * unwrap[0] + unwrap[1] * unwrap[1] + unwrap[2] * unwrap[2]);
     }
-    MPI_Allreduce(a, A, 9, MPI_DOUBLE, MPI_SUM, lmp->world);
+    MPI_Allreduce(a, A, 10, MPI_DOUBLE, MPI_SUM, lmp->world);
     long n = static_cast<long>(A[8]);
     if (n < 1 || A[0] <= 0.0) return;
 
+    // Rotation removal subtracts omega x (x - xcm): positions far from the origin carry an
+    // absolute rounding error eps*|x| per coordinate, i.e. relative error rho*eps in r, which
+    // reaches the net momentum and the net angular momentum alike (rho = sum m|x| / sum m|r|).
+    double rho = 1.0;
+    if (rotation && A[0] > 0.0) {
+      double xc[3] = {A[5] / A[0], A[6] / A[0], A[7] / A[0]}, sr = 0.0;
+      for (int i = 0; i < nlocal; i++) {
+        if (!(mask[i] & groupbit)) continue;
+        double m = rmass ? rmass[i] : mass[type[i]];
+        domain->unmap(x[i], image[i], unwrap);
+        sr += m * std::sqrt((unwrap[0] - xc[0]) * (unwrap[0] - xc[0]) + (unwrap[1] - xc[1]) * (unwrap[1] - xc[1]) +
+                            (unwrap[2] - xc[2]) * (unwrap[2] - xc[2]));
+      }
+      double SR;
+      MPI_Allreduce(&sr, &SR, 1, MPI_DOUBLE, MPI_SUM, lmp->world);
+      if (SR > 0.0) rho = std::fmax(1.0, A[9] / SR);
+    }
+
     if (linear) {
       double p[3] = {A[1], A[2], A[3]};
-      if (A[4] + pre.linear > 0.0 && vector_not_zero(p, A[4] + pre.linear, n))
+      if (A[4] + pre.linear > 0.0 && vector_not_zero(p, (A[4] + pre.linear) * rho, n))
         report("LMP-VEL-001", vec_detail("velocity", "net momentum", p, A[4]), step);
     }
 
@@ -342,7 +361,7 @@ namespace Sanitizer {
       if (!(emin > 1.0e-6 * emax) || B[3] + pre.rotation <= 0.0) return;
       double kappa = emax / emin;
       double L[3] = {B[0], B[1], B[2]};
-      if (vector_not_zero(L, (B[3] + pre.rotation) * kappa, n))
+      if (vector_not_zero(L, (B[3] + pre.rotation) * kappa * rho, n))
         report("LMP-VEL-002", vec_detail("velocity", "net angular momentum", L, B[3]), step);
     }
   }
