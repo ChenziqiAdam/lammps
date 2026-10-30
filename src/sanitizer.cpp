@@ -397,7 +397,11 @@ namespace Sanitizer {
         report("LMP-VEL-001", vec_detail("velocity", "net momentum", p, A[4]), step);
     }
 
-    if (rotation && domain->dimension == 3 && n >= 3) {
+    // Under `fix deform ... remap v` the velocity of an atom in a periodic image is v + h_rate*image:
+    // the angular momentum of a sheared periodic system depends on that convention, and `velocity
+    // create` zeroes it with the flow-corrected velocity and then rescales only the stored one.
+    // The law is not unambiguous there: no verdict.
+    if (rotation && domain->dimension == 3 && n >= 3 && !domain->deform_vremap) {
       double xcm[3] = {A[5] / A[0], A[6] / A[0], A[7] / A[0]};
       double b[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, B[10];
       for (int i = 0; i < nlocal; i++) {
