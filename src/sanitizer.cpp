@@ -89,6 +89,38 @@ namespace Sanitizer {
   // reverse_comm, so a stage's net force/torque vanishes over nlocal+nghost.
   // With newton off each owned atom receives its full force and the law holds
   // over owned atoms only. Bonded stages use newton_bond, pair uses newton_pair.
+  static bool hybrid_scaled(LAMMPS *lmp)
+  {
+    const char *name = lmp->force->pair_style;
+    return name && std::strncmp(name, "hybrid/scaled", 13) == 0;
+  }
+
+  // sum over all bond terms of |F| (both atoms receive it) and of |F|(|x_i|+|x_j|)
+  static void bond_term_scale(LAMMPS *lmp, double &fsum, double &tsum)
+  {
+    fsum = tsum = 0.0;
+    Force *fc = lmp->force;
+    if (!fc->bond) return;
+    Neighbor *nb = lmp->neighbor;
+    double **x = lmp->atom->x;
+    double loc[2] = {0.0, 0.0}, all[2];
+    for (int n = 0; n < nb->nbondlist; n++) {
+      int i = nb->bondlist[n][0], j = nb->bondlist[n][1], type = nb->bondlist[n][2];
+      if (type <= 0) continue;
+      double dx = x[i][0] - x[j][0], dy = x[i][1] - x[j][1], dz = x[i][2] - x[j][2];
+      double rsq = dx * dx + dy * dy + dz * dz, fforce = 0.0;
+      fc->bond->single(type, rsq, i, j, fforce);
+      double fm = std::fabs(fforce) * std::sqrt(rsq);
+      if (!std::isfinite(fm)) continue;
+      loc[0] += 2.0 * fm;
+      loc[1] += fm * (std::sqrt(x[i][0] * x[i][0] + x[i][1] * x[i][1] + x[i][2] * x[i][2]) +
+                      std::sqrt(x[j][0] * x[j][0] + x[j][1] * x[j][1] + x[j][2] * x[j][2]));
+    }
+    MPI_Allreduce(loc, all, 2, MPI_DOUBLE, MPI_SUM, lmp->world);
+    fsum = all[0];
+    tsum = all[1];
+  }
+
   ForceStage::Snap ForceStage::take(Stage stage, long &natoms) const
   {
     Atom *atom = lmp->atom;
@@ -151,6 +183,8 @@ namespace Sanitizer {
   {
     Pair *pair = lmp->force->pair;
     if (!pair || !lmp->force->newton_pair || !pair->vflag_global) return;
+    // hybrid/scaled: per-atom weights and zeroed sub-style virials by design (documented)
+    if (hybrid_scaled(lmp)) return;
     // hbond/dreiding looks its hydrogen up through atom->map (any periodic image) while it tallies
     // minimum-image vectors: its two virial routes legitimately differ
     if (lmp->force->pair_match("hbond", 0) != nullptr) return;
@@ -196,6 +230,10 @@ namespace Sanitizer {
                                 "LMP-FORCE-005"};
     long n;
     Snap s1 = take(stage, n);
+    // hybrid/scaled weights the force on each atom separately (atom-style factors) and may subtract
+    // sub-styles: pair forces are then not equal and opposite by design, and the terms that cancel
+    // are far larger than any net quantity. No verdict for the pair stage.
+    if (stage == PAIR && hybrid_scaled(lmp)) return;
     double df[3], dt[3];
     for (int k = 0; k < 3; k++) {
       df[k] = s1.f[k] - s0.f[k];
@@ -204,6 +242,14 @@ namespace Sanitizer {
     // sum|f| before + after bounds sum|delta f| (triangle inequality)
     double fscale = s1.fscale + s0.fscale;
     double tscale = s1.tscale + s0.tscale;
+    // Bonds: the magnitude of every bond term through Bond::single (force along the bond), the
+    // exact size of the terms that cancel in a relaxed or self-stressed network.
+    if (stage == BOND) {
+      double tf, tt;
+      bond_term_scale(lmp, tf, tt);
+      fscale += tf;
+      tscale += tt;
+    }
     // Net per-atom forces vanish in a relaxed or symmetric configuration while the terms
     // that summed to them do not. The energy of the stage over a length (the interaction range,
     // bounded by the extent of the system) is a force scale for those terms (energies are only
@@ -543,8 +589,28 @@ namespace Sanitizer {
     double sin_a = la > 0.0 ? std::sqrt(a[1] * a[1] + a[2] * a[2]) / la : 1.0;
     double bpar = la > 0.0 && lb > 0.0 ? dot3(a, b) / (la * lb) : 0.0;
     double sin_b = std::sqrt(std::fmax(0.0, 1.0 - bpar * bpar));
+    // second angle: B after the first rotation (A onto +x, about A x xhat), projected on the yz plane
+    double sin_2 = 1.0;
+    {
+      double k[3] = {0.0, a[2], -a[1]};    // A x xhat
+      double kl = std::sqrt(k[1] * k[1] + k[2] * k[2]);
+      if (kl > 0.0 && la > 0.0) {
+        k[1] /= kl;
+        k[2] /= kl;
+        double ct = a[0] / la, st = kl / la;
+        double kxb[3] = {k[1] * b[2] - k[2] * b[1], k[2] * b[0], -k[1] * b[0]};
+        double kb = k[1] * b[1] + k[2] * b[2];
+        double b1[3] = {b[0] * ct + kxb[0] * st + 0.0, b[1] * ct + kxb[1] * st + k[1] * kb * (1.0 - ct),
+                        b[2] * ct + kxb[2] * st + k[2] * kb * (1.0 - ct)};
+        double yz = std::sqrt(b1[1] * b1[1] + b1[2] * b1[2]);
+        if (yz > 0.0) sin_2 = std::fabs(b1[2]) / yz;
+      } else if (lb > 0.0) {
+        double yz = std::sqrt(b[1] * b[1] + b[2] * b[2]);
+        if (yz > 0.0) sin_2 = std::fabs(b[2]) / yz;
+      }
+    }
     double kappa = 1.0;
-    for (double s : {sin_a, sin_b})
+    for (double s : {sin_a, sin_b, sin_2})
       if (s > 0.0) kappa = std::fmax(kappa, std::fmin(1.0 / s, 1.0 / std::sqrt(EPS64)));
     if (!(std::fabs(vg - vr) <= kappa * sum_tol(scale * scale * scale, 1))) {
       bad = true;
@@ -841,6 +907,7 @@ namespace Sanitizer {
     // precondition: every contribution has a global counterpart tallied this step
     if (lmp->update->eflag_global != lmp->update->ntimestep) return;
     if (force->kspace && kspaceflag) return;
+    if (pairflag && force->pair && force->pair_style && std::strncmp(force->pair_style, "hybrid/scaled", 13) == 0) return;
     if (fixflag && lmp->modify->n_energy_atom) return;
     for (int i = 0; i < atom->nlocal; i++)
       if (!(atom->mask[i] & groupbit)) return;    // the compute's group must hold every atom
