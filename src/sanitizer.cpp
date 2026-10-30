@@ -276,12 +276,12 @@ namespace Sanitizer {
     for (int i = 0; i < nlocal; i++) {
       if (!(atom->mask[i] & groupbit)) continue;
       double m = atom->rmass ? atom->rmass[i] : atom->mass[atom->type[i]];
-      lmp->domain->unmap(atom->x[i], atom->image[i], unwrap);
-      double *v = atom->v[i];
-      double vn = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      double vu[3], vlin = std::sqrt(atom->v[i][0] * atom->v[i][0] + atom->v[i][1] * atom->v[i][1] + atom->v[i][2] * atom->v[i][2]);
+      lmp->domain->unmap(atom->x[i], atom->v[i], atom->image[i], atom->mask[i], unwrap, vu);
+      double vn = std::sqrt(vu[0] * vu[0] + vu[1] * vu[1] + vu[2] * vu[2]);
       double rn = std::sqrt((unwrap[0] - c[0]) * (unwrap[0] - c[0]) + (unwrap[1] - c[1]) * (unwrap[1] - c[1]) +
                             (unwrap[2] - c[2]) * (unwrap[2] - c[2]));
-      b[0] += m * vn;
+      b[0] += m * vlin;
       b[1] += m * rn * vn;
     }
     MPI_Allreduce(b, B, 2, MPI_DOUBLE, MPI_SUM, lmp->world);
@@ -357,13 +357,16 @@ namespace Sanitizer {
       for (int i = 0; i < nlocal; i++) {
         if (!(mask[i] & groupbit)) continue;
         double m = rmass ? rmass[i] : mass[type[i]];
-        domain->unmap(x[i], image[i], unwrap);
+        // Angular momentum uses the velocity of the unwrapped image (flow-corrected under
+        // `fix deform ... remap v`), as Group::angmom does; linear momentum uses the raw velocity.
+        double vu[3];
+        domain->unmap(x[i], v[i], image[i], mask[i], unwrap, vu);
         double r[3] = {unwrap[0] - xcm[0], unwrap[1] - xcm[1], unwrap[2] - xcm[2]};
-        b[0] += m * (r[1] * v[i][2] - r[2] * v[i][1]);
-        b[1] += m * (r[2] * v[i][0] - r[0] * v[i][2]);
-        b[2] += m * (r[0] * v[i][1] - r[1] * v[i][0]);
+        b[0] += m * (r[1] * vu[2] - r[2] * vu[1]);
+        b[1] += m * (r[2] * vu[0] - r[0] * vu[2]);
+        b[2] += m * (r[0] * vu[1] - r[1] * vu[0]);
         double rn = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-        double vn = std::sqrt(v[i][0] * v[i][0] + v[i][1] * v[i][1] + v[i][2] * v[i][2]);
+        double vn = std::sqrt(vu[0] * vu[0] + vu[1] * vu[1] + vu[2] * vu[2]);
         b[3] += m * rn * vn;
         double r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
         b[4] += m * (r2 - r[0] * r[0]);
@@ -531,7 +534,19 @@ namespace Sanitizer {
       }
     double vg = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
     double vr = ap[0] * bp[1] * cp[2];    // restricted form is lower triangular
-    if (!(std::fabs(vg - vr) <= sum_tol(scale * scale * scale, 1))) {
+    // The rotation is built from acos of a direction cosine; where A is nearly along +-x (or B
+    // nearly along A) the angle is determined only to eps/sin(theta) (at worst sqrt(eps)), and the
+    // entries that should vanish in the restricted form carry that error into the volume. The
+    // dot-product invariants are unaffected (the matrix stays orthogonal), so only the volume
+    // tolerance carries the condition number.
+    double la = std::sqrt(dot3(a, a)), lb = std::sqrt(dot3(b, b));
+    double sin_a = la > 0.0 ? std::sqrt(a[1] * a[1] + a[2] * a[2]) / la : 1.0;
+    double bpar = la > 0.0 && lb > 0.0 ? dot3(a, b) / (la * lb) : 0.0;
+    double sin_b = std::sqrt(std::fmax(0.0, 1.0 - bpar * bpar));
+    double kappa = 1.0;
+    for (double s : {sin_a, sin_b})
+      if (s > 0.0) kappa = std::fmax(kappa, std::fmin(1.0 / s, 1.0 / std::sqrt(EPS64)));
+    if (!(std::fabs(vg - vr) <= kappa * sum_tol(scale * scale * scale, 1))) {
       bad = true;
       snprintf(buf, sizeof buf, "volume: general %.17g restricted %.17g", vg, vr);
     }
